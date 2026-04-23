@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .actuators import ActuatorDCMotor, ActuatorDelayedPD, ActuatorPD, ActuatorPID
+from .actuators import ActuatorDCMotor, ActuatorDelayedPD, ActuatorPD, ActuatorPID, ActuatorStablePD
 
 
 @dataclass
@@ -40,6 +40,12 @@ API_SCHEMA_HANDLERS: dict[str, dict[str, str]] = {
     "DCMotorAPI": {
         "saturationEffort": "saturation_effort",
         "velocityLimit": "velocity_limit",
+    },
+    "StablePDControllerAPI": {
+        "kp": "kp",
+        "kd": "kd",
+        "maxForce": "max_force",
+        "constForce": "constant_force",
     },
 }
 
@@ -75,7 +81,9 @@ def infer_schemas_from_prim(prim) -> list[str]:
     attr_names = get_actuator_attribute_names(prim)
     schemas = []
 
-    if "ki" in attr_names:
+    if "stablePd" in attr_names:
+        schemas.append("StablePDControllerAPI")
+    elif "ki" in attr_names:
         schemas.append("PIDControllerAPI")
     elif "kp" in attr_names or "kd" in attr_names:
         schemas.append("PDControllerAPI")
@@ -89,12 +97,15 @@ def infer_schemas_from_prim(prim) -> list[str]:
 
 def determine_actuator_class(schemas: list[str]) -> type:
     """Determine actuator class from inferred schemas."""
+    has_stable_pd = "StablePDControllerAPI" in schemas
     has_delay = "DelayAPI" in schemas
     has_pid = "PIDControllerAPI" in schemas
     has_pd = "PDControllerAPI" in schemas
     has_dc_motor = "DCMotorAPI" in schemas
 
-    if has_dc_motor and has_pd:
+    if has_stable_pd:
+        return ActuatorStablePD
+    elif has_dc_motor and has_pd:
         return ActuatorDCMotor
     elif has_delay and has_pd:
         return ActuatorDelayedPD

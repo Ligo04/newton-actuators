@@ -9,6 +9,7 @@ from .net_mlp import ActuatorNetMLP
 from .pd import ActuatorPD
 from .pid import ActuatorPID
 from .remotized_pd import ActuatorRemotizedPD
+from .stable_pd import ActuatorStablePD
 
 __all__ = [
     "Actuator",
@@ -19,4 +20,5 @@ __all__ = [
     "ActuatorPD",
     "ActuatorPID",
     "ActuatorRemotizedPD",
+    "ActuatorStablePD",
 ]

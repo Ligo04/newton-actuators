@@ -25,3 +25,6 @@ htmlcov/
 # IDEs & Editors
 .vscode/
 .idea/
+
+# Local agent tooling
+.aura/

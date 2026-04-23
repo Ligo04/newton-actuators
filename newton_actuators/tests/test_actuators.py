@@ -15,6 +15,7 @@ from newton_actuators import (
     ActuatorPD,
     ActuatorPID,
     ActuatorRemotizedPD,
+    ActuatorStablePD,
 )
 
 _HAS_TORCH = importlib.util.find_spec("torch") is not None
@@ -1320,6 +1321,160 @@ class TestActuatorNetLSTM(unittest.TestCase):
         self.assertFalse(
             all(abs(f - forces[0]) < 1e-6 for f in forces[1:]),
             "LSTM should produce varying outputs across steps due to hidden state",
+        )
+
+
+class TestActuatorStablePD(unittest.TestCase):
+    """Tests for ActuatorStablePD (Tan et al. 2011 scalar stable PD)."""
+
+    def setUp(self):
+        wp.init()
+
+    def test_stable_pd_actuator_creation(self):
+        """ActuatorStablePD creates and reports correct flags."""
+        indices = wp.array([0, 1, 2], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([100.0, 100.0, 100.0], dtype=wp.float32),
+            kd=wp.array([10.0, 10.0, 10.0], dtype=wp.float32),
+            max_force=wp.array([50.0, 50.0, 50.0], dtype=wp.float32),
+        )
+        self.assertIsInstance(actuator, Actuator)
+        self.assertIsInstance(actuator, ActuatorPD)
+        self.assertIsNone(actuator.state())
+        self.assertFalse(actuator.is_stateful())
+        self.assertTrue(actuator.is_graphable())
+
+    def test_stable_pd_equals_pd_when_dt_zero(self):
+        """With dt=0 the predicted-position term vanishes; forces match plain PD."""
+        num_dofs = 3
+        indices = wp.array([0, 1, 2], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([100.0, 100.0, 100.0], dtype=wp.float32),
+            kd=wp.array([2.0, 2.0, 2.0], dtype=wp.float32),
+            max_force=wp.array([1000.0, 1000.0, 1000.0], dtype=wp.float32),
+        )
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_qd=wp.array([0.5, -0.5, 1.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0, 2.0, 3.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_f=wp.zeros(num_dofs, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, None, None, dt=0.0)
+
+        # With dt=0: f = kp*(target - q) + kd*(target_vel - qdot)
+        # = 100*[1,2,3] + 2*[-0.5, 0.5, -1.0] = [99, 201, 298]
+        forces = sim_control.joint_f.numpy()
+        np.testing.assert_allclose(forces, [99.0, 201.0, 298.0], rtol=1e-5)
+
+    def test_stable_pd_predicted_position(self):
+        """With dt>0, the position-error term uses the predicted next-step position."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            kd=wp.array([2.0], dtype=wp.float32),
+            max_force=wp.array([1000.0], dtype=wp.float32),
+        )
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0], dtype=wp.float32),
+            joint_qd=wp.array([1.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, None, None, dt=0.1)
+
+        # f = kp*(target - q - qdot*dt) + kd*(target_vel - qdot)
+        #   = 10*(1 - 0 - 1*0.1) + 2*(0 - 1)
+        #   = 10*0.9 + 2*(-1) = 9 - 2 = 7
+        forces = sim_control.joint_f.numpy()
+        np.testing.assert_allclose(forces, [7.0], rtol=1e-5)
+
+    def test_stable_pd_max_force_clamping(self):
+        """Stable PD output is clamped to ±max_force."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([1000.0], dtype=wp.float32),
+            kd=wp.array([0.0], dtype=wp.float32),
+            max_force=wp.array([5.0], dtype=wp.float32),
+        )
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0], dtype=wp.float32),
+            joint_qd=wp.array([0.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, None, None, dt=0.01)
+
+        forces = sim_control.joint_f.numpy()
+        np.testing.assert_allclose(forces, [5.0], rtol=1e-5)
+
+    def test_stable_pd_resolve_arguments(self):
+        """resolve_arguments inherits from ActuatorPD and fills defaults."""
+        resolved = ActuatorStablePD.resolve_arguments({"kp": 50.0})
+        self.assertEqual(resolved["kp"], 50.0)
+        self.assertEqual(resolved["kd"], 0.0)
+        self.assertEqual(resolved["constant_force"], 0.0)
+
+    def test_stable_pd_requires_dt(self):
+        """step() without dt raises ValueError (dt is mandatory for stable PD)."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            kd=wp.array([2.0], dtype=wp.float32),
+            max_force=wp.array([100.0], dtype=wp.float32),
+        )
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0], dtype=wp.float32),
+            joint_qd=wp.array([0.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+        with self.assertRaises(ValueError):
+            actuator.step(sim_state, sim_control, None, None)
+
+    def test_stable_pd_usd_parser_routing(self):
+        """USD parser routes StablePDControllerAPI schema to ActuatorStablePD."""
+        from newton_actuators._src.usd_parser import determine_actuator_class
+
+        self.assertIs(
+            determine_actuator_class(["StablePDControllerAPI"]),
+            ActuatorStablePD,
+        )
+        # StablePD takes precedence over PD when both are present.
+        self.assertIs(
+            determine_actuator_class(["StablePDControllerAPI", "PDControllerAPI"]),
+            ActuatorStablePD,
         )
 
 

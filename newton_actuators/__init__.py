@@ -12,6 +12,7 @@ from ._src.actuators import (
     ActuatorPD,
     ActuatorPID,
     ActuatorRemotizedPD,
+    ActuatorStablePD,
 )
 from ._src.usd_parser import (
     ParsedActuator,
@@ -29,6 +30,7 @@ __all__ = [
     "ActuatorPD",
     "ActuatorPID",
     "ActuatorRemotizedPD",
+    "ActuatorStablePD",
     "ParsedActuator",
     "parse_actuator_prim",
 ]

@@ -98,6 +98,60 @@ def pd_controller_kernel(
 
 
 @wp.kernel
+def stable_pd_controller_kernel(
+    current_pos: wp.array(dtype=float),
+    current_vel: wp.array(dtype=float),
+    target_pos: wp.array(dtype=float),
+    target_vel: wp.array(dtype=float),
+    control_input: wp.array(dtype=float),
+    state_indices: wp.array(dtype=wp.uint32),
+    target_indices: wp.array(dtype=wp.uint32),
+    output_indices: wp.array(dtype=wp.uint32),
+    kp: wp.array(dtype=float),
+    kd: wp.array(dtype=float),
+    max_force: wp.array(dtype=float),
+    constant_force: wp.array(dtype=float),
+    dt: float,
+    output: wp.array(dtype=float),
+):
+    """Stable PD controller (Tan et al. 2011, scalar/per-DOF form).
+
+    Force: f = constant + act + kp*(target_pos - q - qdot*dt) + kd*(target_vel - v)
+
+    The -qdot*dt term predicts the next-step position (implicit-in-position PD),
+    giving better numerical stability under high gains than a standard PD controller.
+    dt == 0.0 reduces exactly to the standard PD control law.
+
+    Reference: Tan, J., Liu, K., & Turk, G. (2011). "Stable proportional-derivative
+    controllers." IEEE Computer Graphics and Applications, 31(4):34-44.
+    DOI: 10.1109/MCG.2011.30
+
+    Result is clamped to ±max_force and added to output.
+    """
+    i = wp.tid()
+    state_idx = state_indices[i]
+    target_idx = target_indices[i]
+    out_idx = output_indices[i]
+
+    predicted_pos = current_pos[state_idx] + current_vel[state_idx] * dt
+    position_error = target_pos[target_idx] - predicted_pos
+    velocity_error = target_vel[target_idx] - current_vel[state_idx]
+
+    const_f = float(0.0)
+    if constant_force:
+        const_f = constant_force[i]
+
+    act = float(0.0)
+    if control_input:
+        act = control_input[target_idx]
+
+    force = const_f + act + kp[i] * position_error + kd[i] * velocity_error
+    force = wp.clamp(force, -max_force[i], max_force[i])
+
+    output[out_idx] = output[out_idx] + force
+
+
+@wp.kernel
 def nn_output_kernel(
     nn_torques: wp.array(dtype=float),
     max_force: wp.array(dtype=float),
