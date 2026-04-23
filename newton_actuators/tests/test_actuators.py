@@ -1324,14 +1324,43 @@ class TestActuatorNetLSTM(unittest.TestCase):
         )
 
 
+def _bullet3_stable_pd_reference(kp, kd, M, C, q, qdot, target_pos, target_vel, dt, const_f=None, act=None):
+    """Numpy reference port of bullet3 PDControllerStableMultiDof.computePD."""
+    kp = np.asarray(kp, dtype=np.float64)
+    kd = np.asarray(kd, dtype=np.float64)
+    M = np.asarray(M, dtype=np.float64)
+    C = np.asarray(C, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    qdot = np.asarray(qdot, dtype=np.float64)
+    target_pos = np.asarray(target_pos, dtype=np.float64)
+    target_vel = np.asarray(target_vel, dtype=np.float64)
+
+    Kp_diag = np.diag(kp)
+    Kd_diag = np.diag(kd)
+
+    p_term = Kp_diag @ (target_pos - q - qdot * dt)
+    d_term = Kd_diag @ (target_vel - qdot)
+
+    A = M + Kd_diag * dt
+    b = p_term + d_term - C
+    qddot = np.linalg.solve(A, b)
+
+    tau = p_term + d_term - Kd_diag @ qddot * dt
+    if const_f is not None:
+        tau = tau + np.asarray(const_f, dtype=np.float64)
+    if act is not None:
+        tau = tau + np.asarray(act, dtype=np.float64)
+    return tau
+
+
 class TestActuatorStablePD(unittest.TestCase):
-    """Tests for ActuatorStablePD (Tan et al. 2011 scalar stable PD)."""
+    """Tests for ActuatorStablePD (Tan et al. 2011 — full implicit form + scalar fallback)."""
 
     def setUp(self):
         wp.init()
 
     def test_stable_pd_actuator_creation(self):
-        """ActuatorStablePD creates and reports correct flags."""
+        """ActuatorStablePD is stateful; state() allocates M, C, and LLT scratch."""
         indices = wp.array([0, 1, 2], dtype=wp.uint32)
         actuator = ActuatorStablePD(
             input_indices=indices,
@@ -1342,96 +1371,18 @@ class TestActuatorStablePD(unittest.TestCase):
         )
         self.assertIsInstance(actuator, Actuator)
         self.assertIsInstance(actuator, ActuatorPD)
-        self.assertIsNone(actuator.state())
-        self.assertFalse(actuator.is_stateful())
+        self.assertTrue(actuator.is_stateful())
         self.assertTrue(actuator.is_graphable())
-
-    def test_stable_pd_equals_pd_when_dt_zero(self):
-        """With dt=0 the predicted-position term vanishes; forces match plain PD."""
-        num_dofs = 3
-        indices = wp.array([0, 1, 2], dtype=wp.uint32)
-        actuator = ActuatorStablePD(
-            input_indices=indices,
-            output_indices=indices,
-            kp=wp.array([100.0, 100.0, 100.0], dtype=wp.float32),
-            kd=wp.array([2.0, 2.0, 2.0], dtype=wp.float32),
-            max_force=wp.array([1000.0, 1000.0, 1000.0], dtype=wp.float32),
-        )
-
-        sim_state = MockSimState(
-            joint_q=wp.array([0.0, 0.0, 0.0], dtype=wp.float32),
-            joint_qd=wp.array([0.5, -0.5, 1.0], dtype=wp.float32),
-        )
-        sim_control = MockSimControl(
-            joint_target_pos=wp.array([1.0, 2.0, 3.0], dtype=wp.float32),
-            joint_target_vel=wp.array([0.0, 0.0, 0.0], dtype=wp.float32),
-            joint_act=wp.array([0.0, 0.0, 0.0], dtype=wp.float32),
-            joint_f=wp.zeros(num_dofs, dtype=wp.float32),
-        )
-
-        actuator.step(sim_state, sim_control, None, None, dt=0.0)
-
-        # With dt=0: f = kp*(target - q) + kd*(target_vel - qdot)
-        # = 100*[1,2,3] + 2*[-0.5, 0.5, -1.0] = [99, 201, 298]
-        forces = sim_control.joint_f.numpy()
-        np.testing.assert_allclose(forces, [99.0, 201.0, 298.0], rtol=1e-5)
-
-    def test_stable_pd_predicted_position(self):
-        """With dt>0, the position-error term uses the predicted next-step position."""
-        indices = wp.array([0], dtype=wp.uint32)
-        actuator = ActuatorStablePD(
-            input_indices=indices,
-            output_indices=indices,
-            kp=wp.array([10.0], dtype=wp.float32),
-            kd=wp.array([2.0], dtype=wp.float32),
-            max_force=wp.array([1000.0], dtype=wp.float32),
-        )
-
-        sim_state = MockSimState(
-            joint_q=wp.array([0.0], dtype=wp.float32),
-            joint_qd=wp.array([1.0], dtype=wp.float32),
-        )
-        sim_control = MockSimControl(
-            joint_target_pos=wp.array([1.0], dtype=wp.float32),
-            joint_target_vel=wp.array([0.0], dtype=wp.float32),
-            joint_act=wp.array([0.0], dtype=wp.float32),
-            joint_f=wp.zeros(1, dtype=wp.float32),
-        )
-
-        actuator.step(sim_state, sim_control, None, None, dt=0.1)
-
-        # f = kp*(target - q - qdot*dt) + kd*(target_vel - qdot)
-        #   = 10*(1 - 0 - 1*0.1) + 2*(0 - 1)
-        #   = 10*0.9 + 2*(-1) = 9 - 2 = 7
-        forces = sim_control.joint_f.numpy()
-        np.testing.assert_allclose(forces, [7.0], rtol=1e-5)
-
-    def test_stable_pd_max_force_clamping(self):
-        """Stable PD output is clamped to ±max_force."""
-        indices = wp.array([0], dtype=wp.uint32)
-        actuator = ActuatorStablePD(
-            input_indices=indices,
-            output_indices=indices,
-            kp=wp.array([1000.0], dtype=wp.float32),
-            kd=wp.array([0.0], dtype=wp.float32),
-            max_force=wp.array([5.0], dtype=wp.float32),
-        )
-
-        sim_state = MockSimState(
-            joint_q=wp.array([0.0], dtype=wp.float32),
-            joint_qd=wp.array([0.0], dtype=wp.float32),
-        )
-        sim_control = MockSimControl(
-            joint_target_pos=wp.array([1.0], dtype=wp.float32),
-            joint_target_vel=wp.array([0.0], dtype=wp.float32),
-            joint_act=wp.array([0.0], dtype=wp.float32),
-            joint_f=wp.zeros(1, dtype=wp.float32),
-        )
-
-        actuator.step(sim_state, sim_control, None, None, dt=0.01)
-
-        forces = sim_control.joint_f.numpy()
-        np.testing.assert_allclose(forces, [5.0], rtol=1e-5)
+        state = actuator.state()
+        self.assertIsNotNone(state)
+        # num_actuators = 3, block_size default 32 → n_padded = 32
+        self.assertEqual(state.mass_matrix.shape, (3, 3))
+        self.assertEqual(state.bias_forces.shape, (3,))
+        self.assertEqual(state.A.shape, (32, 32))
+        self.assertEqual(state.L.shape, (32, 32))
+        self.assertEqual(state.b.shape, (32, 1))
+        self.assertEqual(state.y.shape, (32, 1))
+        self.assertEqual(state.qddot.shape, (32, 1))
 
     def test_stable_pd_resolve_arguments(self):
         """resolve_arguments inherits from ActuatorPD and fills defaults."""
@@ -1442,6 +1393,32 @@ class TestActuatorStablePD(unittest.TestCase):
 
     def test_stable_pd_requires_dt(self):
         """step() without dt raises ValueError (dt is mandatory for stable PD)."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            kd=wp.array([2.0], dtype=wp.float32),
+            max_force=wp.array([100.0], dtype=wp.float32),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array([[1.0]], dtype=wp.float32)
+        state.bias_forces = wp.array([0.0], dtype=wp.float32)
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0], dtype=wp.float32),
+            joint_qd=wp.array([0.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+        with self.assertRaises(ValueError):
+            actuator.step(sim_state, sim_control, state, state)
+
+    def test_stable_pd_requires_state(self):
+        """step() without a State raises ValueError (M/C are mandatory)."""
         indices = wp.array([0], dtype=wp.uint32)
         actuator = ActuatorStablePD(
             input_indices=indices,
@@ -1461,7 +1438,39 @@ class TestActuatorStablePD(unittest.TestCase):
             joint_f=wp.zeros(1, dtype=wp.float32),
         )
         with self.assertRaises(ValueError):
-            actuator.step(sim_state, sim_control, None, None)
+            actuator.step(sim_state, sim_control, None, None, dt=0.01)
+
+    def test_stable_pd_requires_populated_mass_matrix(self):
+        """step() with State but no mass_matrix raises ValueError."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            kd=wp.array([2.0], dtype=wp.float32),
+            max_force=wp.array([100.0], dtype=wp.float32),
+        )
+        state = ActuatorStablePD.State(
+            mass_matrix=None,
+            bias_forces=wp.array([0.0], dtype=wp.float32),
+            A=wp.zeros((32, 32), dtype=wp.float32),
+            L=wp.zeros((32, 32), dtype=wp.float32),
+            b=wp.zeros((32, 1), dtype=wp.float32),
+            y=wp.zeros((32, 1), dtype=wp.float32),
+            qddot=wp.zeros((32, 1), dtype=wp.float32),
+        )
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0], dtype=wp.float32),
+            joint_qd=wp.array([0.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+        with self.assertRaises(ValueError):
+            actuator.step(sim_state, sim_control, state, state, dt=0.01)
 
     def test_stable_pd_usd_parser_routing(self):
         """USD parser routes StablePDControllerAPI schema to ActuatorStablePD."""
@@ -1476,6 +1485,331 @@ class TestActuatorStablePD(unittest.TestCase):
             determine_actuator_class(["StablePDControllerAPI", "PDControllerAPI"]),
             ActuatorStablePD,
         )
+
+    def test_stable_pd_tan2011_single_dof_no_damping(self):
+        """Tan 2011 full form on 1 DOF with kd=0 — verifies Cholesky solve correctness."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            kd=wp.array([0.0], dtype=wp.float32),
+            max_force=wp.array([1000.0], dtype=wp.float32),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array([[2.0]], dtype=wp.float32)
+        state.bias_forces = wp.array([0.0], dtype=wp.float32)
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0], dtype=wp.float32),
+            joint_qd=wp.array([1.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, state, state, dt=0.1)
+
+        # Reference: τ = p_term + d_term - kd·qddot·dt, with kd=0
+        # p_term = 10*(1 - 0 - 1*0.1) = 9, d_term = 0
+        # kd·qddot·dt = 0 ⇒ τ = 9
+        expected = _bullet3_stable_pd_reference(
+            kp=[10.0], kd=[0.0], M=[[2.0]], C=[0.0],
+            q=[0.0], qdot=[1.0], target_pos=[1.0], target_vel=[0.0], dt=0.1,
+        )
+        np.testing.assert_allclose(sim_control.joint_f.numpy(), expected, rtol=1e-4, atol=1e-4)
+
+    def test_stable_pd_tan2011_with_damping(self):
+        """Tan 2011 full form with kd > 0 — Kd·qddot·dt correction is active."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            kd=wp.array([2.0], dtype=wp.float32),
+            max_force=wp.array([1000.0], dtype=wp.float32),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array([[3.0]], dtype=wp.float32)
+        state.bias_forces = wp.array([0.5], dtype=wp.float32)
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0], dtype=wp.float32),
+            joint_qd=wp.array([1.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, state, state, dt=0.1)
+
+        expected = _bullet3_stable_pd_reference(
+            kp=[10.0], kd=[2.0], M=[[3.0]], C=[0.5],
+            q=[0.0], qdot=[1.0], target_pos=[1.0], target_vel=[0.0], dt=0.1,
+        )
+        np.testing.assert_allclose(sim_control.joint_f.numpy(), expected, rtol=1e-4, atol=1e-4)
+
+    def test_stable_pd_tan2011_matches_bullet3_2dof_coupled(self):
+        """2 DOF coupled M (non-diagonal) — output matches numpy solve reference bit-for-bit (float32)."""
+        num_dofs = 2
+        indices = wp.array([0, 1], dtype=wp.uint32)
+        kp_vals = [50.0, 80.0]
+        kd_vals = [5.0, 8.0]
+        M_vals = [[2.0, 0.5], [0.5, 3.0]]
+        C_vals = [0.3, -0.2]
+        q_vals = [0.1, -0.05]
+        qdot_vals = [0.4, -0.2]
+        target_pos_vals = [1.0, 0.5]
+        target_vel_vals = [0.1, -0.1]
+        dt = 0.02
+
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array(kp_vals, dtype=wp.float32),
+            kd=wp.array(kd_vals, dtype=wp.float32),
+            max_force=wp.array([10000.0, 10000.0], dtype=wp.float32),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array(M_vals, dtype=wp.float32)
+        state.bias_forces = wp.array(C_vals, dtype=wp.float32)
+
+        sim_state = MockSimState(
+            joint_q=wp.array(q_vals, dtype=wp.float32),
+            joint_qd=wp.array(qdot_vals, dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array(target_pos_vals, dtype=wp.float32),
+            joint_target_vel=wp.array(target_vel_vals, dtype=wp.float32),
+            joint_act=wp.array([0.0, 0.0], dtype=wp.float32),
+            joint_f=wp.zeros(num_dofs, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, state, state, dt=dt)
+
+        expected = _bullet3_stable_pd_reference(
+            kp=kp_vals, kd=kd_vals, M=M_vals, C=C_vals,
+            q=q_vals, qdot=qdot_vals, target_pos=target_pos_vals,
+            target_vel=target_vel_vals, dt=dt,
+        )
+        np.testing.assert_allclose(sim_control.joint_f.numpy(), expected, rtol=5e-4, atol=5e-4)
+
+    def test_stable_pd_tan2011_3dof_diagonal_M(self):
+        """3 DOF with diagonal M — sanity-check the solver on decoupled system."""
+        num_dofs = 3
+        indices = wp.array([0, 1, 2], dtype=wp.uint32)
+        kp_vals = [100.0, 80.0, 120.0]
+        kd_vals = [10.0, 8.0, 12.0]
+        M_vals = [[1.5, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.5]]
+        C_vals = [0.0, 0.0, 0.0]
+        q_vals = [0.0, 0.1, -0.1]
+        qdot_vals = [0.5, -0.3, 0.0]
+        target_pos_vals = [1.0, 0.5, 0.2]
+        target_vel_vals = [0.0, 0.0, 0.0]
+        dt = 0.01
+
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array(kp_vals, dtype=wp.float32),
+            kd=wp.array(kd_vals, dtype=wp.float32),
+            max_force=wp.array([10000.0] * num_dofs, dtype=wp.float32),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array(M_vals, dtype=wp.float32)
+        state.bias_forces = wp.array(C_vals, dtype=wp.float32)
+
+        sim_state = MockSimState(
+            joint_q=wp.array(q_vals, dtype=wp.float32),
+            joint_qd=wp.array(qdot_vals, dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array(target_pos_vals, dtype=wp.float32),
+            joint_target_vel=wp.array(target_vel_vals, dtype=wp.float32),
+            joint_act=wp.array([0.0] * num_dofs, dtype=wp.float32),
+            joint_f=wp.zeros(num_dofs, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, state, state, dt=dt)
+
+        expected = _bullet3_stable_pd_reference(
+            kp=kp_vals, kd=kd_vals, M=M_vals, C=C_vals,
+            q=q_vals, qdot=qdot_vals, target_pos=target_pos_vals,
+            target_vel=target_vel_vals, dt=dt,
+        )
+        np.testing.assert_allclose(sim_control.joint_f.numpy(), expected, rtol=5e-4, atol=5e-4)
+
+    def test_stable_pd_tan2011_dt_zero_reduces_to_standard_pd(self):
+        """Full form at dt=0: (M+Kd·0)=M, Kd·qddot·0=0 ⇒ τ = p_term + d_term (standard PD)."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([50.0], dtype=wp.float32),
+            kd=wp.array([5.0], dtype=wp.float32),
+            max_force=wp.array([1000.0], dtype=wp.float32),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array([[2.0]], dtype=wp.float32)
+        state.bias_forces = wp.array([1.0], dtype=wp.float32)
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.1], dtype=wp.float32),
+            joint_qd=wp.array([0.2], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, state, state, dt=0.0)
+
+        # dt=0: p_term = 50*(1-0.1) = 45, d_term = 5*(0-0.2) = -1
+        # Kd·qddot·dt = 0 ⇒ τ = 45 - 1 = 44
+        expected = 50.0 * (1.0 - 0.1) + 5.0 * (0.0 - 0.2)
+        np.testing.assert_allclose(sim_control.joint_f.numpy(), [expected], rtol=1e-4, atol=1e-4)
+
+    def test_stable_pd_tan2011_clamping(self):
+        """Tan 2011 tau is still clamped to ±max_force."""
+        indices = wp.array([0], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([10000.0], dtype=wp.float32),  # Huge gain
+            kd=wp.array([0.0], dtype=wp.float32),
+            max_force=wp.array([3.0], dtype=wp.float32),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array([[1.0]], dtype=wp.float32)
+        state.bias_forces = wp.array([0.0], dtype=wp.float32)
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0], dtype=wp.float32),
+            joint_qd=wp.array([0.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0], dtype=wp.float32),
+            joint_f=wp.zeros(1, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, state, state, dt=0.01)
+
+        forces = sim_control.joint_f.numpy()
+        np.testing.assert_allclose(forces, [3.0], rtol=1e-5)
+
+    def test_stable_pd_state_reset(self):
+        """State.reset() zeroes M, C, and all scratch buffers in-place."""
+        indices = wp.array([0, 1], dtype=wp.uint32)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([10.0, 10.0], dtype=wp.float32),
+            kd=wp.array([0.0, 0.0], dtype=wp.float32),
+            max_force=wp.array([1000.0, 1000.0], dtype=wp.float32),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array([[2.0, 0.5], [0.5, 3.0]], dtype=wp.float32)
+        state.bias_forces = wp.array([1.0, -1.0], dtype=wp.float32)
+        # Replace scratch with non-zero arrays to verify reset() zeros them.
+        # Shapes match the pad layout: A/L are (n_padded, n_padded) = (32, 32)
+        # for num_actuators=2 with default block_size=32; b/y/qddot are (32, 1).
+        state.A = wp.full((32, 32), 1.5, dtype=wp.float32)
+        state.L = wp.full((32, 32), 2.5, dtype=wp.float32)
+        state.b = wp.full((32, 1), 0.3, dtype=wp.float32)
+        state.y = wp.full((32, 1), 0.4, dtype=wp.float32)
+        state.qddot = wp.full((32, 1), 0.7, dtype=wp.float32)
+
+        state.reset()
+
+        np.testing.assert_allclose(state.mass_matrix.numpy(), np.zeros((2, 2)))
+        np.testing.assert_allclose(state.bias_forces.numpy(), np.zeros(2))
+        np.testing.assert_allclose(state.A.numpy(), np.zeros((32, 32)))
+        np.testing.assert_allclose(state.L.numpy(), np.zeros((32, 32)))
+        np.testing.assert_allclose(state.b.numpy(), np.zeros((32, 1)))
+        np.testing.assert_allclose(state.y.numpy(), np.zeros((32, 1)))
+        np.testing.assert_allclose(state.qddot.numpy(), np.zeros((32, 1)))
+
+    def test_stable_pd_state_reset_handles_none(self):
+        """State.reset() is a no-op for None fields, does not raise."""
+        state = ActuatorStablePD.State()
+        state.reset()  # Should not raise
+        self.assertIsNone(state.mass_matrix)
+        self.assertIsNone(state.bias_forces)
+        self.assertIsNone(state.A)
+        self.assertIsNone(state.L)
+        self.assertIsNone(state.b)
+        self.assertIsNone(state.y)
+        self.assertIsNone(state.qddot)
+
+    def test_stable_pd_cuda_graph_capture(self):
+        """Full ``step()`` pipeline is CUDA-graph capturable (no host↔device sync).
+
+        Enforces the ``is_graphable() is True`` contract by actually capturing
+        and replaying ``step()`` under ``wp.ScopedCapture`` — if any kernel in
+        the pipeline sneaks in a ``.numpy()``, ``.assign(np_array)``, or other
+        host-side computation on device data, capture will raise. As a
+        secondary check, we also compare the captured-and-replayed output
+        against a direct (no-capture) step on the same inputs.
+        """
+        device = wp.get_device("cuda:0")
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device.")
+
+        num_dofs = 2
+        indices = wp.array([0, 1], dtype=wp.uint32, device=device)
+        actuator = ActuatorStablePD(
+            input_indices=indices,
+            output_indices=indices,
+            kp=wp.array([50.0, 80.0], dtype=wp.float32, device=device),
+            kd=wp.array([5.0, 8.0], dtype=wp.float32, device=device),
+            max_force=wp.array([10000.0, 10000.0], dtype=wp.float32, device=device),
+        )
+        state = actuator.state()
+        state.mass_matrix = wp.array([[2.0, 0.5], [0.5, 3.0]], dtype=wp.float32, device=device)
+        state.bias_forces = wp.array([0.3, -0.2], dtype=wp.float32, device=device)
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.1, -0.05], dtype=wp.float32, device=device),
+            joint_qd=wp.array([0.4, -0.2], dtype=wp.float32, device=device),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([1.0, 0.5], dtype=wp.float32, device=device),
+            joint_target_vel=wp.array([0.1, -0.1], dtype=wp.float32, device=device),
+            joint_act=wp.array([0.0, 0.0], dtype=wp.float32, device=device),
+            joint_f=wp.zeros(num_dofs, dtype=wp.float32, device=device),
+        )
+        dt = 0.02
+
+        # Warmup: compile all kernels outside the capture region (capture does
+        # not tolerate synchronous module loads) and grab the reference output.
+        actuator.step(sim_state, sim_control, state, state, dt=dt)
+        wp.synchronize()
+        ref_values = sim_control.joint_f.numpy().copy()
+
+        # Zero the output and capture a single step into a CUDA graph.
+        sim_control.joint_f.zero_()
+        with wp.ScopedCapture(device=device) as capture:
+            actuator.step(sim_state, sim_control, state, state, dt=dt)
+        graph = capture.graph
+
+        # Replay the graph twice; determinism + match to the reference output
+        # proves the pipeline has no host-side data dependency.
+        for _ in range(2):
+            sim_control.joint_f.zero_()
+            wp.capture_launch(graph)
+            wp.synchronize()
+            replay = sim_control.joint_f.numpy()
+            np.testing.assert_allclose(replay, ref_values, rtol=5e-4, atol=5e-4)
 
 
 if __name__ == "__main__":

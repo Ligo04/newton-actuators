@@ -98,6 +98,69 @@ def pd_controller_kernel(
 
 
 @wp.kernel
+def stable_pd_build_rhs_kernel(
+    current_pos: wp.array(dtype=float),
+    current_vel: wp.array(dtype=float),
+    target_pos: wp.array(dtype=float),
+    target_vel: wp.array(dtype=float),
+    state_indices: wp.array(dtype=wp.uint32),
+    target_indices: wp.array(dtype=wp.uint32),
+    kp: wp.array(dtype=float),
+    kd: wp.array(dtype=float),
+    bias_forces: wp.array(dtype=float),
+    dt: float,
+    b: wp.array(dtype=float),
+):
+    """Assemble the Tan 2011 rhs vector per actuator:
+
+        b[i] = kp[i]·(target_pos - q - q̇·dt) + kd[i]·(target_vel - q̇) - C[i]
+
+    One thread per actuator (``dim=num_actuators``). Writes the full rhs
+    consumed by the host-side ``(M + diag(kd)·dt)·qddot = b`` solve in
+    ``ActuatorStablePD._run_controller``.
+    """
+    i = wp.tid()
+    state_idx = state_indices[i]
+    target_idx = target_indices[i]
+
+    q_i = current_pos[state_idx]
+    qd_i = current_vel[state_idx]
+    qt_i = target_pos[target_idx]
+    qdt_i = target_vel[target_idx]
+
+    p_term_i = kp[i] * (qt_i - q_i - qd_i * dt)
+    d_term_i = kd[i] * (qdt_i - qd_i)
+
+    c_i = float(0.0)
+    if bias_forces:
+        c_i = bias_forces[i]
+
+    b[i] = p_term_i + d_term_i - c_i
+
+
+@wp.kernel
+def stable_pd_build_A_kernel(
+    mass_matrix: wp.array(dtype=float, ndim=2),
+    kd: wp.array(dtype=float),
+    dt: float,
+    A: wp.array(dtype=float, ndim=2),
+):
+    """Assemble ``A[:n, :n] = M + diag(kd)·dt`` for the Tan 2011 implicit solve.
+
+    Launched with ``dim=(n, n)``. One thread per matrix entry, no ``for``.
+    ``A`` is expected to be the ``(n_padded, n_padded)`` scratch buffer
+    allocated via ``_linalg.pad_identity_2d`` — this kernel only writes the
+    real ``[:n, :n]`` region; the identity-padded phantom region ``[n:, n:]``
+    is established once at allocation time and preserved across steps.
+    """
+    i, j = wp.tid()
+    a_ij = mass_matrix[i, j]
+    if i == j:
+        a_ij = a_ij + kd[i] * dt
+    A[i, j] = a_ij
+
+
+@wp.kernel
 def stable_pd_controller_kernel(
     current_pos: wp.array(dtype=float),
     current_vel: wp.array(dtype=float),
@@ -111,44 +174,50 @@ def stable_pd_controller_kernel(
     kd: wp.array(dtype=float),
     max_force: wp.array(dtype=float),
     constant_force: wp.array(dtype=float),
+    qddot: wp.array(dtype=float),
     dt: float,
     output: wp.array(dtype=float),
 ):
-    """Stable PD controller (Tan et al. 2011, scalar/per-DOF form).
+    """Tan 2011 step 5 only — compute τ given the pre-solved implicit acceleration ``qddot``::
 
-    Force: f = constant + act + kp*(target_pos - q - qdot*dt) + kd*(target_vel - v)
+        τ = clamp(const + act + kp·(target_pos - q - q̇·dt)
+                              + kd·(target_vel - q̇)
+                              - kd·qddot·dt,  ±max_force)
 
-    The -qdot*dt term predicts the next-step position (implicit-in-position PD),
-    giving better numerical stability under high gains than a standard PD controller.
-    dt == 0.0 reduces exactly to the standard PD control law.
+    ``qddot`` must already satisfy ``(M + diag(kd)·dt)·qddot = p_term + d_term - C``;
+    populate it by launching :func:`stable_pd_build_rhs_kernel` and then solving
+    the dense system on the host (see ``ActuatorStablePD._run_controller``).
 
-    Reference: Tan, J., Liu, K., & Turk, G. (2011). "Stable proportional-derivative
-    controllers." IEEE Computer Graphics and Applications, 31(4):34-44.
-    DOI: 10.1109/MCG.2011.30
+    One thread per actuator (``dim=num_actuators``). Adds to ``output``.
 
-    Result is clamped to ±max_force and added to output.
+    Reference: Tan, J., Liu, K., & Turk, G. (2011). "Stable proportional-
+    derivative controllers." IEEE Computer Graphics and Applications,
+    31(4):34-44. DOI: 10.1109/MCG.2011.30
     """
     i = wp.tid()
     state_idx = state_indices[i]
     target_idx = target_indices[i]
     out_idx = output_indices[i]
 
-    predicted_pos = current_pos[state_idx] + current_vel[state_idx] * dt
-    position_error = target_pos[target_idx] - predicted_pos
-    velocity_error = target_vel[target_idx] - current_vel[state_idx]
+    q_i = current_pos[state_idx]
+    qd_i = current_vel[state_idx]
+    qt_i = target_pos[target_idx]
+    qdt_i = target_vel[target_idx]
+
+    p_term_i = kp[i] * (qt_i - q_i - qd_i * dt)
+    d_term_i = kd[i] * (qdt_i - qd_i)
 
     const_f = float(0.0)
     if constant_force:
         const_f = constant_force[i]
-
     act = float(0.0)
     if control_input:
         act = control_input[target_idx]
 
-    force = const_f + act + kp[i] * position_error + kd[i] * velocity_error
-    force = wp.clamp(force, -max_force[i], max_force[i])
+    tau_i = const_f + act + p_term_i + d_term_i - kd[i] * qddot[i] * dt
+    tau_i = wp.clamp(tau_i, -max_force[i], max_force[i])
 
-    output[out_idx] = output[out_idx] + force
+    output[out_idx] = output[out_idx] + tau_i
 
 
 @wp.kernel
